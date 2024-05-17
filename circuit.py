@@ -288,7 +288,7 @@ def get_circuit_cluster(dataset,
                         node_threshold=0.1,
                         edge_threshold=0.01,
                         device="cuda:0",
-                        dict_path="dictionaries/pythia-70m-deduped/",
+                        dict_path="dictionary_learning/dictionaries/pythia-70m-deduped/",
                         dataset_name="cluster_circuit",
                         circuit_dir="circuits/",
                         plot_dir="circuits/figures/",
@@ -421,7 +421,7 @@ if __name__ == '__main__':
                         help="The max length (if using sum aggregation) or exact length (if not aggregating) of examples.")
     parser.add_argument('--model', type=str, default='EleutherAI/pythia-70m-deduped',
                         help="The Huggingface ID of the model you wish to test.")
-    parser.add_argument("--dict_path", type=str, default="dictionaries/pythia-70m-deduped/",
+    parser.add_argument("--dict_path", type=str, default="dictionary_learning/dictionaries/pythia-70m-deduped/",
                         help="Path to all dictionaries for your language model.")
     parser.add_argument('--d_model', type=int, default=512,
                         help="Hidden size of the language model.")
@@ -455,6 +455,11 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda:0')
     args = parser.parse_args()
 
+    if not os.path.exists(args.circuit_dir):
+        os.makedirs(args.circuit_dir)
+
+    if not os.path.exists(args.plot_dir):
+        os.makedirs(args.plot_dir)
 
     device = args.device
 
@@ -475,20 +480,20 @@ if __name__ == '__main__':
             dictionaries[resids[i]] = IdentityDict(args.d_model)
     else:
         dictionaries[embed] = AutoEncoder.from_pretrained(
-            f'{args.dict_path}/embed/{args.dict_id}_{args.dict_size}/ae.pt',
+            os.path.join(args.dict_path, f'embed/{args.dict_id}_{args.dict_size}/ae.pt'),
             device=device
         )
         for i in range(len(model.gpt_neox.layers)):
             dictionaries[attns[i]] = AutoEncoder.from_pretrained(
-                f'{args.dict_path}/attn_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt',
+                os.path.join(args.dict_path, f'attn_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt'),
                 device=device
             )
             dictionaries[mlps[i]] = AutoEncoder.from_pretrained(
-                f'{args.dict_path}/mlp_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt',
+                os.path.join(args.dict_path, f'mlp_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt'),
                 device=device
             )
             dictionaries[resids[i]] = AutoEncoder.from_pretrained(
-                f'{args.dict_path}/resid_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt',
+                os.path.join(args.dict_path, f'resid_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt'),
                 device=device
             )
     
@@ -580,11 +585,11 @@ if __name__ == '__main__':
             "nodes": nodes,
             "edges": edges
         }
-        with open(f'{args.circuit_dir}/{save_basename}_dict{args.dict_id}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}.pt', 'wb') as outfile:
+        with open(os.path.join(args.circuit_dir, f'{save_basename}_dict{args.dict_id}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}.pt'), 'wb') as outfile:
             t.save(save_dict, outfile)
 
     else:
-        with open(f'{args.circuit_dir}/{save_basename}_dict{args.dict_id}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}.pt', 'rb') as infile:
+        with open(os.path.join(args.circuit_dir, f'{save_basename}_dict{args.dict_id}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}.pt'), 'rb') as infile:
             save_dict = t.load(infile)
         nodes = save_dict['nodes']
         edges = save_dict['edges']
@@ -611,7 +616,7 @@ if __name__ == '__main__':
             edge_threshold=args.edge_threshold, 
             pen_thickness=args.pen_thickness, 
             annotations=annotations, 
-            save_dir=f'{args.plot_dir}/{save_basename}_dict{args.dict_id}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}'
+            save_dir=os.path.join(args.plot_dir, f'{save_basename}_dict{args.dict_id}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}')
         )
     else:
         plot_circuit(
@@ -622,5 +627,5 @@ if __name__ == '__main__':
             edge_threshold=args.edge_threshold, 
             pen_thickness=args.pen_thickness, 
             annotations=annotations, 
-            save_dir=f'{args.plot_dir}/{save_basename}_dict{args.dict_id}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}'
+            save_dir=os.path.join(args.plot_dir, f'{save_basename}_dict{args.dict_id}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}')
         )
