@@ -4,6 +4,7 @@ from tqdm import tqdm
 from numpy import ndindex
 from typing import Dict, Union
 from activation_utils import SparseAct
+from functools import partial
 
 DEBUGGING = False
 
@@ -24,48 +25,87 @@ def _pe_attrib(
         metric_kwargs=dict(),
 ):
     
-    # first run through a test input to figure out which hidden states are tuples
-    is_tuple = {}
-    with model.trace("_"):
-        for submodule in submodules:
-            is_tuple[submodule] = type(submodule.output.shape) == tuple
-
     hidden_states_clean = {}
     grads = {}
-    with model.trace(clean, **tracer_kwargs):
-        for i, submodule in enumerate(submodules):
-            dictionary = dictionaries[submodule]
 
-            if i == 0: # embeddings
-                x = submodule.output.clone()
-            elif i % 3 == 1: # MLPs
-                x = submodule.output.clone()
-            elif i % 3 == 2: # attention
-                x = submodule.input[0][0].clone()
-            else: # resis_post
-                x = submodule.output[0].clone()
+    #_, clean_cache = model.get_cache_fw(clean, submodules)
+    sae_hooks = []
 
-            x_hat, f = dictionary(x, output_features=True) # x_hat implicitly depends on f
-            residual = x - x_hat
-            hidden_states_clean[submodule] = SparseAct(act=f, res=residual).save()
-            grads[submodule] = hidden_states_clean[submodule].grad.save()
+    def sae_hook(act, hook, recon):
+        return recon
+
+    def sae_hook(act, hook, sae):
+        original_shape = act.shape
+        
+        if len(original_shape) == 4:
+            x = act.reshape(act.shape[0], act.shape[1], -1).clone()
+        else:
+            x = act.clone()
+
+        x.requires_grad_(True)
+        x_hat, f = sae(x, output_features=True)
+        f.retain_grad()
+        residual = x - x_hat
+        hidden_states_clean[hook.name] = f
+
+        if residual.grad is None:
             residual.grad = t.zeros_like(residual)
-            x_recon = x_hat + residual
 
-            if i == 0: # embeddings
-                submodule.output = x_recon
-            elif i % 3 == 1: # MLPs
-                submodule.output = x_recon
-            elif i % 3 == 2: # attention
-                submodule.input[0][0] = x_recon
-            else: # resis_post
-                x = submodule.output[0] = x_recon
-            
-            x.grad = x_recon.grad
-        metric_clean = metric_fn(model, **metric_kwargs).save()
-        metric_clean.sum().backward()
-    hidden_states_clean = {k : v.value for k, v in hidden_states_clean.items()}
-    grads = {k : v.value for k, v in grads.items()}
+        x_recon = x_hat + residual
+        
+        if len(original_shape) == 4:
+            return x_recon.reshape(original_shape)
+
+        return x_recon
+
+    ### FIX
+    """
+    for i, submodule in enumerate(submodules):
+        dictionary = dictionaries[submodule]
+
+        if i % 3 == 2:  # attention
+            original_shape = clean_cache[submodule].shape
+            x = clean_cache[submodule].reshape(clean_cache[submodule].shape[0], clean_cache[submodule].shape[1], -1).detach()
+        else:
+            x = clean_cache[submodule].detach()
+
+        # Ensure x requires gradients
+        x.requires_grad_(True)
+
+        x_hat, f = dictionary(x, output_features=True)  # x_hat implicitly depends on f
+        residual = x - x_hat
+        hidden_states_clean[submodule] = f
+
+        # Retain gradients for non-leaf tensors
+        hidden_states_clean[submodule].retain_grad()
+
+        # Initialize gradient for residual if not already initialized
+        if residual.grad is None:
+            residual.grad = t.zeros_like(residual)
+
+        x_recon = x_hat + residual
+
+        if i % 3 == 2:  # attention
+            sae_hooks.append((submodule, partial(sae_hook, recon=x_recon.reshape(original_shape))))
+        else:
+            sae_hooks.append((submodule, partial(sae_hook, recon=x_recon)))
+    """
+    for i, submodule in enumerate(submodules):
+        dictionary = dictionaries[submodule]
+        sae_hooks.append((submodule, partial(sae_hook, sae=dictionary)))
+
+    # Forward pass with hooks
+    logits = model.run_with_hooks(clean, fwd_hooks=sae_hooks)
+    metric_clean = metric_fn(logits, **metric_kwargs)
+
+    # Backward pass
+    metric_clean.sum().backward()
+
+    # Collect gradients
+    for submodule in submodules:
+        if submodule in hidden_states_clean:
+            grads[submodule] = hidden_states_clean[submodule].grad
+    
 
     if patch is None:
         hidden_states_patch = {
@@ -73,26 +113,19 @@ def _pe_attrib(
         }
         total_effect = None
     else:
-        hidden_states_patch = {}
-        with model.trace(patch, **tracer_kwargs), t.inference_mode():
-            for submodule in submodules:
-                dictionary = dictionaries[submodule]
-                x = submodule.output
-                if is_tuple[submodule]:
-                    x = x[0]
-                x_hat, f = dictionary(x, output_features=True)
-                residual = x - x_hat
-                hidden_states_patch[submodule] = SparseAct(act=f, res=residual).save()
-            metric_patch = metric_fn(model, **metric_kwargs).save()
-        total_effect = (metric_patch.value - metric_clean.value).detach()
-        hidden_states_patch = {k : v.value for k, v in hidden_states_patch.items()}
+        corr_logits, hidden_states_patch = model.get_cache_fw(clean, submodules)
+        metric_patch = metric_fn(corr_logits, **metric_kwargs)
+        total_effect = (metric_patch - metric_clean).detach()
 
     effects = {}
     deltas = {}
     for submodule in submodules:
         patch_state, clean_state, grad = hidden_states_patch[submodule], hidden_states_clean[submodule], grads[submodule]
+        if len(patch_state.shape) == 4:
+            patch_state = patch_state.reshape(patch_state.shape[0], patch_state.shape[1], -1)
+
         delta = patch_state - clean_state.detach() if patch_state is not None else -clean_state.detach()
-        effect = delta @ grad
+        effect = delta * grad
         effects[submodule] = effect
         deltas[submodule] = delta
         grads[submodule] = grad
@@ -312,6 +345,7 @@ def jvp(
         left_vec : Union[SparseAct, Dict[int, SparseAct]],
         right_vec : SparseAct,
         return_without_right = False,
+        device='cuda'
 ):
     """
     Return a sparse shape [# downstream features + 1, # upstream features + 1] tensor of Jacobian-vector products.
@@ -319,9 +353,9 @@ def jvp(
 
     if not downstream_features: # handle empty list
         if not return_without_right:
-            return t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(model.device)
+            return t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(device)
         else:
-            return t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(model.device), t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(model.device)
+            return t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(device), t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(device)
 
     # first run through a test input to figure out which hidden states are tuples
     is_tuple = {}
@@ -386,7 +420,7 @@ def jvp(
     vjv_indices = t.tensor(
         [[downstream_feat for downstream_feat in downstream_features for _ in vjv_indices[downstream_feat].value],
          t.cat([vjv_indices[downstream_feat].value for downstream_feat in downstream_features], dim=0)]
-    ).to(model.device)
+    ).to(device)
     vjv_values = t.cat([vjv_values[downstream_feat].value for downstream_feat in downstream_features], dim=0)
 
     if not return_without_right:
@@ -395,7 +429,7 @@ def jvp(
     jv_indices = t.tensor(
         [[downstream_feat for downstream_feat in downstream_features for _ in jv_indices[downstream_feat].value],
          t.cat([jv_indices[downstream_feat].value for downstream_feat in downstream_features], dim=0)]
-    ).to(model.device)
+    ).to(device)
     jv_values = t.cat([jv_values[downstream_feat].value for downstream_feat in downstream_features], dim=0)
 
     return (

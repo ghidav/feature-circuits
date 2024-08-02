@@ -19,8 +19,8 @@ def get_name(component, layer, idx):
 def plot_circuit(nodes, edges, layers=6, node_threshold=0.1, edge_threshold=0.01, pen_thickness=1, annotations=None, save_dir='circuit'):
 
     # get min and max node effects
-    min_effect = min([v.to_tensor().min() for n, v in nodes.items() if n != 'y'])
-    max_effect = max([v.to_tensor().max() for n, v in nodes.items() if n != 'y'])
+    min_effect = min([v.min() for n, v in nodes.items() if n != 'y'])
+    max_effect = max([v.max() for n, v in nodes.items() if n != 'y'])
     scale = max(abs(min_effect), abs(max_effect))
 
     # for deciding shade of node
@@ -75,11 +75,11 @@ def plot_circuit(nodes, edges, layers=6, node_threshold=0.1, edge_threshold=0.01
 
     # rename embed to resid_-1
     nodes_by_submod = {
-        'resid_-1' : {tuple(idx.tolist()) : nodes['embed'].to_tensor()[tuple(idx)].item() for idx in (nodes['embed'].to_tensor().abs() > node_threshold).nonzero()}
+        'resid_-1' : {tuple(idx.tolist()) : nodes['embed'][tuple(idx)].item() for idx in (nodes['embed'].abs() > node_threshold).nonzero()}
     }
     for layer in range(layers):
         for component in ['attn', 'mlp', 'resid']:
-            submod_nodes = nodes[f'{component}_{layer}'].to_tensor()
+            submod_nodes = nodes[f'{component}_{layer}']
             nodes_by_submod[f'{component}_{layer}'] = {
                 tuple(idx.tolist()) : submod_nodes[tuple(idx)].item() for idx in (submod_nodes.abs() > node_threshold).nonzero()
             }
@@ -164,15 +164,13 @@ def plot_circuit(nodes, edges, layers=6, node_threshold=0.1, edge_threshold=0.01
     G.render(save_dir, format='png', cleanup=True)
 
 
-def plot_circuit_posaligned(nodes, edges, layers=6, length=6, example_text="The managers that the parent likes",
+def plot_circuit_posaligned(nodes, edges, layers=6, length=6, example_str_tokens=["The", "managers", "that"],
                             node_threshold=0.1, edge_threshold=0.01, pen_thickness=3, annotations=None, save_dir='circuit'):
 
     # get min and max node effects
-    min_effect = min([v.to_tensor().min() for n, v in nodes.items() if n != 'y'])
-    max_effect = max([v.to_tensor().max() for n, v in nodes.items() if n != 'y'])
+    min_effect = min([v.min() for n, v in nodes.items() if n != 'y'])
+    max_effect = max([v.max() for n, v in nodes.items() if n != 'y'])
     scale = max(abs(min_effect), abs(max_effect))
-
-    words = example_text.split()
 
     # for deciding shade of node
     def to_hex(number):
@@ -219,7 +217,7 @@ def plot_circuit_posaligned(nodes, edges, layers=6, length=6, example_text="The 
     G.node_attr.update(shape="box", style="rounded")
 
     nodes_by_submod = {
-        'resid_-1' : {tuple(idx.tolist()) : nodes['embed'].to_tensor()[tuple(idx)].item() for idx in (nodes['embed'].to_tensor().abs() > node_threshold).nonzero()}
+        'resid_-1' : {tuple(idx.tolist()) : nodes['embed'][tuple(idx)].item() for idx in (nodes['embed'].abs() > node_threshold).nonzero()}
     }
     nodes_by_seqpos = defaultdict(list)
     nodes_by_layer = defaultdict(list)
@@ -227,7 +225,7 @@ def plot_circuit_posaligned(nodes, edges, layers=6, length=6, example_text="The 
 
     for layer in range(layers):
         for component in ['attn', 'mlp', 'resid']:
-            submod_nodes = nodes[f'{component}_{layer}'].to_tensor()
+            submod_nodes = nodes[f'{component}_{layer}']
             nodes_by_submod[f'{component}_{layer}'] = {
                 tuple(idx.tolist()) : submod_nodes[tuple(idx)].item() for idx in (submod_nodes.abs() > node_threshold).nonzero()
             }
@@ -238,7 +236,7 @@ def plot_circuit_posaligned(nodes, edges, layers=6, length=6, example_text="The 
         subgraph.attr(rank='same')
         prev_word = None
         for idx in range(length):
-            word = words[idx]
+            word = example_str_tokens[idx]
             subgraph.node(word, shape='none', group=str(idx), fillcolor='transparent',
                           fontsize="30pt")
             if prev_word is not None:
@@ -263,8 +261,8 @@ def plot_circuit_posaligned(nodes, edges, layers=6, length=6, example_text="The 
                                       style='filled')
                     
                     if len(nodes_by_seqpos[seq_pos]) == 0:
-                        G.edge(words[int(seq_pos)], name, style='dotted', arrowhead='none', penwidth="1.5")
-                        edgeset.add((words[int(seq_pos)], name))
+                        G.edge(example_str_tokens[int(seq_pos)], name, style='dotted', arrowhead='none', penwidth="1.5")
+                        edgeset.add((example_str_tokens[int(seq_pos)], name))
 
                     nodes_by_seqpos[seq_pos].append(name)
                     nodes_by_layer[layer].append(name)
