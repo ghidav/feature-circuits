@@ -13,9 +13,13 @@ from activation_utils import SparseAct
 from attribution import patching_effect, jvp
 from circuit_plotting import plot_circuit, plot_circuit_posaligned
 from dictionary_learning import AutoEncoder
+from dictionary_learning.dictionary import IdentityDict
 from loading_utils import load_examples, load_examples_nopair
 from nnsight import LanguageModel
+from utils import BASE_DIR, keys
 
+os.environ["HF_TOKEN"] = keys["huggingface"]
+os.environ["HF_HOME"] = "/workspace/huggingface"
 
 ###### utilities for dealing with sparse COO tensors ######
 def flatten_index(idxs, shape):
@@ -288,7 +292,7 @@ def get_circuit_cluster(dataset,
                         node_threshold=0.1,
                         edge_threshold=0.01,
                         device="cuda:0",
-                        dict_path="dictionaries/pythia-70m-deduped/",
+                        dict_path="dictionary_learning",
                         dataset_name="cluster_circuit",
                         circuit_dir="circuits/",
                         plot_dir="circuits/figures/",
@@ -296,28 +300,29 @@ def get_circuit_cluster(dataset,
                         dictionaries=None,):
     
     model = LanguageModel(model_name, device_map=device, dispatch=True)
+    dict_path = os.path.join(BASE_DIR, dict_path)
 
-    embed = model.gpt_neox.embed_in
-    attns = [layer.attention for layer in model.gpt_neox.layers]
-    mlps = [layer.mlp for layer in model.gpt_neox.layers]
-    resids = [layer for layer in model.gpt_neox.layers]
+    embed = model.model.embed_in
+    attns = [layer.self_attn for layer in model.model.layers]
+    mlps = [layer.mlp for layer in model.model.layers]
+    resids = [layer for layer in model.model.layers]
     dictionaries = {}
     dictionaries[embed] = AutoEncoder.from_pretrained(
-        os.path.join(dict_path, f'embed/{dict_id}_{dict_size}/ae.pt'),
+        os.path.join(dict_path, f'embed/params.npz'),
         device=device
     )
-    for i in range(len(model.gpt_neox.layers)):
-        dictionaries[attns[i]] = AutoEncoder.from_pretrained(
-            os.path.join(dict_path, f'attn_out_layer{i}/{dict_id}_{dict_size}/ae.pt'),
-            device=device
+    for i in range(len(model.model.layers)):
+        dictionaries[attns[i]] = AutoEncoder.from_pretrained_npz(
+            os.path.join(dict_path, f'attn_out_layer_{i}/params.npz'),
+            device=device, activation_dim=args.d_model, dict_size=args.dict_size
         )
-        dictionaries[mlps[i]] = AutoEncoder.from_pretrained(
-            os.path.join(dict_path, f'mlp_out_layer{i}/{dict_id}_{dict_size}/ae.pt'),
-            device=device
+        dictionaries[mlps[i]] = AutoEncoder.from_pretrained_npz(
+            os.path.join(dict_path, f'mlp_out_layer_{i}/params.npz'),
+            device=device, activation_dim=args.d_model, dict_size=args.dict_size
         )
-        dictionaries[resids[i]] = AutoEncoder.from_pretrained(
-            os.path.join(dict_path, f'resid_out_layer{i}/{dict_id}_{dict_size}/ae.pt'),
-            device=device
+        dictionaries[resids[i]] = AutoEncoder.from_pretrained_npz(
+            os.path.join(dict_path, f'resid_out_layer_{i}/params.npz'),
+            device=device, activation_dim=args.d_model, dict_size=args.dict_size
         )
 
     examples = load_examples_nopair(dataset, max_examples, model, length=max_length)
@@ -341,7 +346,7 @@ def get_circuit_cluster(dataset,
         def metric_fn(model):
             return (
                 -1 * t.gather(
-                    t.nn.functional.log_softmax(model.embed_out.output[:,-1,:], dim=-1), dim=-1, index=clean_answer_idxs.view(-1, 1)
+                    t.nn.functional.log_softmax(model.lm_head.output[:,-1,:], dim=-1), dim=-1, index=clean_answer_idxs.view(-1, 1)
                 ).squeeze(-1)
             )
         
@@ -403,7 +408,7 @@ def get_circuit_cluster(dataset,
     plot_circuit(
         nodes, 
         edges, 
-        layers=len(model.gpt_neox.layers), 
+        layers=len(model.model.layers), 
         node_threshold=node_threshold, 
         edge_threshold=edge_threshold, 
         pen_thickness=1, 
@@ -419,19 +424,19 @@ if __name__ == '__main__':
                         help="The number of examples from the --dataset over which to average indirect effects.")
     parser.add_argument('--example_length', '-l', type=int, default=None,
                         help="The max length (if using sum aggregation) or exact length (if not aggregating) of examples.")
-    parser.add_argument('--model', type=str, default='EleutherAI/pythia-70m-deduped',
+    parser.add_argument('--model', type=str, default='google/gemma-2-2b',
                         help="The Huggingface ID of the model you wish to test.")
-    parser.add_argument("--dict_path", type=str, default="dictionaries/pythia-70m-deduped/",
+    parser.add_argument("--dict_path", type=str, default="dictionary_learning",
                         help="Path to all dictionaries for your language model.")
-    parser.add_argument('--d_model', type=int, default=512,
+    parser.add_argument('--d_model', type=int, default=2304,
                         help="Hidden size of the language model.")
-    parser.add_argument('--dict_id', type=str, default=10,
+    parser.add_argument('--dict_id', type=str, default="id",
                         help="ID of the dictionaries. Use `id` to obtain circuits on neurons/heads directly.")
-    parser.add_argument('--dict_size', type=int, default=32768,
+    parser.add_argument('--dict_size', type=int, default=16384,
                         help="The width of the dictionary encoder.")
     parser.add_argument('--batch_size', type=int, default=32,
                         help="Number of examples to process at once when running circuit discovery.")
-    parser.add_argument('--aggregation', type=str, default='sum',
+    parser.add_argument('--aggregation', type=str, default='none',
                         help="Aggregation across token positions. Should be one of `sum` or `none`.")
     parser.add_argument('--node_threshold', type=float, default=0.2,
                         help="Indirect effect threshold for keeping circuit nodes.")
@@ -460,38 +465,53 @@ if __name__ == '__main__':
 
     model = LanguageModel(args.model, device_map=device, dispatch=True)
 
-    embed = model.gpt_neox.embed_in
-    attns = [layer.attention for layer in model.gpt_neox.layers]
-    mlps = [layer.mlp for layer in model.gpt_neox.layers]
-    resids = [layer for layer in model.gpt_neox.layers]
+    embed = model.model.embed_tokens
+    attns = [layer.self_attn for layer in model.model.layers]
+    mlps = [layer.mlp for layer in model.model.layers]
+    resids = [layer for layer in model.model.layers]
 
     dictionaries = {}
     if args.dict_id == 'id':
-        from dictionary_learning.dictionary import IdentityDict
         dictionaries[embed] = IdentityDict(args.d_model)
-        for i in range(len(model.gpt_neox.layers)):
+
+        print("Using identity dictionaries...")
+        for i in range(len(model.model.layers)):
             dictionaries[attns[i]] = IdentityDict(args.d_model)
             dictionaries[mlps[i]] = IdentityDict(args.d_model)
             dictionaries[resids[i]] = IdentityDict(args.d_model)
+        print("Dictionaries loaded.")
     else:
-        dictionaries[embed] = AutoEncoder.from_pretrained(
-            f'{args.dict_path}/embed/{args.dict_id}_{args.dict_size}/ae.pt',
-            device=device
-        )
-        for i in range(len(model.gpt_neox.layers)):
-            dictionaries[attns[i]] = AutoEncoder.from_pretrained(
-                f'{args.dict_path}/attn_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt',
-                device=device
-            )
-            dictionaries[mlps[i]] = AutoEncoder.from_pretrained(
-                f'{args.dict_path}/mlp_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt',
-                device=device
-            )
-            dictionaries[resids[i]] = AutoEncoder.from_pretrained(
-                f'{args.dict_path}/resid_out_layer{i}/{args.dict_id}_{args.dict_size}/ae.pt',
-                device=device
-            )
-    
+        embed_path = f'{args.dict_path}/embed/params.npz'
+        if os.path.exists(embed_path):
+            dictionaries[embed] = AutoEncoder.from_pretrained_npz(embed_path, device=device, activation_dim=args.d_model, dict_size=args.dict_size)
+        else:
+            print(f"Warning: Path {embed_path} not found. Using IdentityDict.")
+            dictionaries[embed] = IdentityDict(args.d_model)
+
+        print("Loading dictionaries...")
+        for i in tqdm(range(len(model.model.layers))):
+            attn_path = f'{args.dict_path}/attn_out_layer_{i}/params.npz'
+            if os.path.exists(attn_path):
+                dictionaries[attns[i]] = AutoEncoder.from_pretrained_npz(attn_path, device=device, activation_dim=args.d_model, dict_size=args.dict_size)
+            else:
+                print(f"Warning: Path {attn_path} not found. Using IdentityDict.")
+                dictionaries[attns[i]] = IdentityDict(args.d_model)
+
+            mlp_path = f'{args.dict_path}/mlp_out_layer_{i}/params.npz'
+            if os.path.exists(mlp_path):
+                dictionaries[mlps[i]] = AutoEncoder.from_pretrained_npz(mlp_path, device=device, activation_dim=args.d_model, dict_size=args.dict_size)
+            else:
+                print(f"Warning: Path {mlp_path} not found. Using IdentityDict.")
+                dictionaries[mlps[i]] = IdentityDict(args.d_model)
+
+            resid_path = f'{args.dict_path}/resid_out_layer_{i}/params.npz'
+            if os.path.exists(resid_path):
+                dictionaries[resids[i]] = AutoEncoder.from_pretrained_npz(resid_path, device=device, activation_dim=args.d_model, dict_size=args.dict_size)
+            else:
+                print(f"Warning: Path {resid_path} not found. Using IdentityDict.")
+                dictionaries[resids[i]] = IdentityDict(args.d_model)
+        print("Dictionaries loaded.")
+        
     if args.nopair:
         save_basename = os.path.splitext(os.path.basename(args.dataset))[0]
         examples = load_examples_nopair(args.dataset, args.num_examples, model, length=args.example_length)
@@ -526,7 +546,7 @@ if __name__ == '__main__':
                 def metric_fn(model):
                     return (
                         -1 * t.gather(
-                            t.nn.functional.log_softmax(model.embed_out.output[:,-1,:], dim=-1), dim=-1, index=clean_answer_idxs.view(-1, 1)
+                            t.nn.functional.log_softmax(model.lm_head.output[:,-1,:], dim=-1), dim=-1, index=clean_answer_idxs.view(-1, 1)
                         ).squeeze(-1)
                     )
             else:
@@ -534,8 +554,8 @@ if __name__ == '__main__':
                 patch_answer_idxs = t.tensor([e['patch_answer'] for e in batch], dtype=t.long, device=device)
                 def metric_fn(model):
                     return (
-                        t.gather(model.embed_out.output[:,-1,:], dim=-1, index=patch_answer_idxs.view(-1, 1)).squeeze(-1) - \
-                        t.gather(model.embed_out.output[:,-1,:], dim=-1, index=clean_answer_idxs.view(-1, 1)).squeeze(-1)
+                        t.gather(model.lm_head.output[:,-1,:], dim=-1, index=patch_answer_idxs.view(-1, 1)).squeeze(-1) - \
+                        t.gather(model.lm_head.output[:,-1,:], dim=-1, index=clean_answer_idxs.view(-1, 1)).squeeze(-1)
                     )
             
             nodes, edges = get_circuit(
@@ -604,7 +624,7 @@ if __name__ == '__main__':
         plot_circuit_posaligned(
             nodes, 
             edges,
-            layers=len(model.gpt_neox.layers), 
+            layers=len(model.model.layers), 
             length=args.example_length,
             example_text=example,
             node_threshold=args.node_threshold, 
@@ -617,7 +637,7 @@ if __name__ == '__main__':
         plot_circuit(
             nodes, 
             edges, 
-            layers=len(model.gpt_neox.layers), 
+            layers=len(model.model.layers), 
             node_threshold=args.node_threshold, 
             edge_threshold=args.edge_threshold, 
             pen_thickness=args.pen_thickness, 

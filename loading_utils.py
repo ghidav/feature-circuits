@@ -6,6 +6,7 @@ import torch as t
 import torch.nn.functional as F
 from dictionary_learning.dictionary import AutoEncoder
 from dataclasses import dataclass
+from utils import BASE_DIR
 
 @dataclass
 class DictionaryCfg():
@@ -20,7 +21,7 @@ class DictionaryCfg():
 
 def load_examples(dataset, num_examples, model, seed=12, pad_to_length=None, length=None):
     examples = []
-    dataset_items = open(dataset).readlines()
+    dataset_items = open(os.path.join(BASE_DIR, dataset)).readlines()
     random.seed(seed)
     random.shuffle(dataset_items)
     for line in dataset_items:
@@ -29,9 +30,9 @@ def load_examples(dataset, num_examples, model, seed=12, pad_to_length=None, len
                                         padding=False).input_ids
         patch_prefix = model.tokenizer(data["patch_prefix"], return_tensors="pt",
                                         padding=False).input_ids
-        clean_answer = model.tokenizer(data["clean_answer"], return_tensors="pt",
+        clean_answer = model.tokenizer(data["clean_answer"], return_tensors="pt", add_special_tokens=False,
                                         padding=False).input_ids
-        patch_answer = model.tokenizer(data["patch_answer"], return_tensors="pt",
+        patch_answer = model.tokenizer(data["patch_answer"], return_tensors="pt", add_special_tokens=False,
                                         padding=False).input_ids
         # only keep examples where answers are single tokens
         if clean_prefix.shape[1] != patch_prefix.shape[1]:
