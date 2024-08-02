@@ -460,7 +460,7 @@ if __name__ == '__main__':
     model = LanguageModel(args.model, device_map=device, dispatch=True)
 
     embed = model.model.embed_tokens
-    attns = [layer.self_attn for layer in model.model.layers]
+    attns = [layer.self_attn.o_proj for layer in model.model.layers]
     mlps = [layer.post_feedforward_layernorm for layer in model.model.layers]
     resids = [layer for layer in model.model.layers]
 

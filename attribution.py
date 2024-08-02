@@ -36,11 +36,11 @@ def _pe_attrib(
         for submodule in submodules:
             dictionary = dictionaries[submodule]
             if 'attn' in submodule.named_modules()[-1][0]:
-                x = submodule.o_proj.input
+                x = submodule.input
             else:
                 x = submodule.output
-                if is_tuple[submodule]:
-                    x = x[0]
+            if is_tuple[submodule]:
+                x = x[0]
             x_hat, f = dictionary(x, output_features=True) # x_hat implicitly depends on f
             residual = x - x_hat
             hidden_states_clean[submodule] = SparseAct(act=f, res=residual).save()
