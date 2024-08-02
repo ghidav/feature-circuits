@@ -13,7 +13,7 @@ from activation_utils import SparseAct
 from attribution import patching_effect, jvp
 from circuit_plotting import plot_circuit, plot_circuit_posaligned
 from dictionary_learning import AutoEncoder
-from dictionary_learning.dictionary import IdentityDict
+from dictionary_learning.dictionary import IdentityDict, JumpReLUSAE
 from loading_utils import load_examples, load_examples_nopair
 from nnsight import LanguageModel
 from utils import BASE_DIR, keys
@@ -99,6 +99,7 @@ def get_circuit(
         nodes_only=False,
         node_threshold=0.1,
         edge_threshold=0.01,
+        method='attrib'
 ):
     all_submods = [embed] + [submod for layer_submods in zip(mlps, attns, resids) for submod in layer_submods]
     
@@ -111,7 +112,7 @@ def get_circuit(
         dictionaries,
         metric_fn,
         metric_kwargs=metric_kwargs,
-        method='ig' # get better approximations for early layers by using ig
+        method=method # get better approximations for early layers by using ig
     )
 
     def unflatten(tensor): # will break if dictionaries vary in size between layers
@@ -307,23 +308,14 @@ def get_circuit_cluster(dataset,
     mlps = [layer.mlp for layer in model.model.layers]
     resids = [layer for layer in model.model.layers]
     dictionaries = {}
-    dictionaries[embed] = AutoEncoder.from_pretrained(
+    dictionaries[embed] = JumpReLUSAE.from_pretrained(
         os.path.join(dict_path, f'embed/params.npz'),
         device=device
     )
     for i in range(len(model.model.layers)):
-        dictionaries[attns[i]] = AutoEncoder.from_pretrained_npz(
-            os.path.join(dict_path, f'attn_out_layer_{i}/params.npz'),
-            device=device, activation_dim=args.d_model, dict_size=args.dict_size
-        )
-        dictionaries[mlps[i]] = AutoEncoder.from_pretrained_npz(
-            os.path.join(dict_path, f'mlp_out_layer_{i}/params.npz'),
-            device=device, activation_dim=args.d_model, dict_size=args.dict_size
-        )
-        dictionaries[resids[i]] = AutoEncoder.from_pretrained_npz(
-            os.path.join(dict_path, f'resid_out_layer_{i}/params.npz'),
-            device=device, activation_dim=args.d_model, dict_size=args.dict_size
-        )
+        dictionaries[attns[i]] = JumpReLUSAE.from_pretrained_npz(os.path.join(dict_path, f'attn_out_layer_{i}/params.npz'), device=device)
+        dictionaries[mlps[i]] = JumpReLUSAE.from_pretrained_npz(os.path.join(dict_path, f'mlp_out_layer_{i}/params.npz'), device=device)
+        dictionaries[resids[i]] = JumpReLUSAE.from_pretrained_npz(os.path.join(dict_path, f'resid_out_layer_{i}/params.npz'), device=device)
 
     examples = load_examples_nopair(dataset, max_examples, model, length=max_length)
 
@@ -363,6 +355,7 @@ def get_circuit_cluster(dataset,
             aggregation="sum",
             node_threshold=node_threshold,
             edge_threshold=edge_threshold,
+            method='attrib'
         )
 
         if running_nodes is None:
@@ -430,7 +423,7 @@ if __name__ == '__main__':
                         help="Path to all dictionaries for your language model.")
     parser.add_argument('--d_model', type=int, default=2304,
                         help="Hidden size of the language model.")
-    parser.add_argument('--dict_id', type=str, default="id",
+    parser.add_argument('--dict_id', type=str, default=10,
                         help="ID of the dictionaries. Use `id` to obtain circuits on neurons/heads directly.")
     parser.add_argument('--dict_size', type=int, default=16384,
                         help="The width of the dictionary encoder.")
@@ -460,6 +453,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda:0')
     args = parser.parse_args()
 
+    dict_path = os.path.join(BASE_DIR, args.dict_path)
 
     device = args.device
 
@@ -467,7 +461,7 @@ if __name__ == '__main__':
 
     embed = model.model.embed_tokens
     attns = [layer.self_attn for layer in model.model.layers]
-    mlps = [layer.mlp for layer in model.model.layers]
+    mlps = [layer.post_feedforward_layernorm for layer in model.model.layers]
     resids = [layer for layer in model.model.layers]
 
     dictionaries = {}
@@ -481,32 +475,32 @@ if __name__ == '__main__':
             dictionaries[resids[i]] = IdentityDict(args.d_model)
         print("Dictionaries loaded.")
     else:
-        embed_path = f'{args.dict_path}/embed/params.npz'
+        embed_path = f'{dict_path}/embed/params.npz'
         if os.path.exists(embed_path):
-            dictionaries[embed] = AutoEncoder.from_pretrained_npz(embed_path, device=device, activation_dim=args.d_model, dict_size=args.dict_size)
+            dictionaries[embed] = JumpReLUSAE.from_pretrained_npz(embed_path, device=device)
         else:
             print(f"Warning: Path {embed_path} not found. Using IdentityDict.")
             dictionaries[embed] = IdentityDict(args.d_model)
 
         print("Loading dictionaries...")
         for i in tqdm(range(len(model.model.layers))):
-            attn_path = f'{args.dict_path}/attn_out_layer_{i}/params.npz'
+            attn_path = f'{dict_path}/attn_out_layer_{i}/params.npz'
             if os.path.exists(attn_path):
-                dictionaries[attns[i]] = AutoEncoder.from_pretrained_npz(attn_path, device=device, activation_dim=args.d_model, dict_size=args.dict_size)
+                dictionaries[attns[i]] = JumpReLUSAE.from_pretrained_npz(attn_path, device=device)
             else:
                 print(f"Warning: Path {attn_path} not found. Using IdentityDict.")
                 dictionaries[attns[i]] = IdentityDict(args.d_model)
 
-            mlp_path = f'{args.dict_path}/mlp_out_layer_{i}/params.npz'
+            mlp_path = f'{dict_path}/mlp_out_layer_{i}/params.npz'
             if os.path.exists(mlp_path):
-                dictionaries[mlps[i]] = AutoEncoder.from_pretrained_npz(mlp_path, device=device, activation_dim=args.d_model, dict_size=args.dict_size)
+                dictionaries[mlps[i]] = JumpReLUSAE.from_pretrained_npz(mlp_path, device=device)
             else:
                 print(f"Warning: Path {mlp_path} not found. Using IdentityDict.")
                 dictionaries[mlps[i]] = IdentityDict(args.d_model)
 
-            resid_path = f'{args.dict_path}/resid_out_layer_{i}/params.npz'
+            resid_path = f'{dict_path}/resid_out_layer_{i}/params.npz'
             if os.path.exists(resid_path):
-                dictionaries[resids[i]] = AutoEncoder.from_pretrained_npz(resid_path, device=device, activation_dim=args.d_model, dict_size=args.dict_size)
+                dictionaries[resids[i]] = JumpReLUSAE.from_pretrained_npz(resid_path, device=device)
             else:
                 print(f"Warning: Path {resid_path} not found. Using IdentityDict.")
                 dictionaries[resids[i]] = IdentityDict(args.d_model)
