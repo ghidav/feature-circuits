@@ -119,12 +119,12 @@ def get_circuit(
     )
 
     def unflatten(tensor): # will break if dictionaries vary in size between layers
-        b, s, f = effects[resids[0]].shape
+        b, s, f = effects[resids[0]].act.shape
         unflattened = rearrange(tensor, '(b s x) -> b s x', b=b, s=s)
         return SparseAct(act=unflattened[...,:f], res=unflattened[...,f:])
     
     features_by_submod = {
-        submod : (effects[submod].flatten().abs() > node_threshold).nonzero().flatten().tolist() for submod in all_submods
+        submod : (effects[submod].to_tensor().flatten().abs() > node_threshold).nonzero().flatten().tolist() for submod in all_submods
     }
 
     n_layers = len(resids)
@@ -145,7 +145,7 @@ def get_circuit(
         return nodes, None
 
     edges = defaultdict(lambda:{})
-    edges[f'resid_{len(resids)-1}'] = { 'y' : effects[resids[-1]].flatten().to_sparse() }
+    edges[f'resid_{len(resids)-1}'] = { 'y' : effects[resids[-1]].to_tensor().flatten().to_sparse() }
 
     def N(upstream, downstream):
         return jvp(
@@ -218,13 +218,13 @@ def get_circuit(
     # rearrange weight matrices
     for child in edges:
         # get shape for child
-        bc, sc, fc = nodes[child].shape
+        bc, sc, fc = nodes[child].act.shape
         for parent in edges[child]:
             weight_matrix = edges[child][parent]
             if parent == 'y':
                 weight_matrix = sparse_reshape(weight_matrix, (bc, sc, fc+1))
             else:
-                bp, sp, fp = nodes[parent].shape
+                bp, sp, fp = nodes[parent].act.shape
                 assert bp == bc
                 weight_matrix = sparse_reshape(weight_matrix, (bp, sp, fp+1, bc, sc, fc+1))
             edges[child][parent] = weight_matrix
@@ -245,13 +245,13 @@ def get_circuit(
 
         # aggregate across batch dimension
         for child in edges:
-            bc, fc = nodes[child].shape
+            bc, fc = nodes[child].act.shape
             for parent in edges[child]:
                 weight_matrix = edges[child][parent]
                 if parent == 'y':
                     weight_matrix = weight_matrix.sum(dim=0) / bc
                 else:
-                    bp, fp = nodes[parent].shape
+                    bp, fp = nodes[parent].act.shape
                     assert bp == bc
                     weight_matrix = weight_matrix.sum(dim=(0,2)) / bc
                 edges[child][parent] = weight_matrix
@@ -264,14 +264,14 @@ def get_circuit(
         # aggregate across batch dimensions
         for child in edges:
             # get shape for child
-            bc, sc, fc = nodes[child].shape
+            bc, sc, fc = nodes[child].act.shape
             for parent in edges[child]:
                 weight_matrix = edges[child][parent]
                 if parent == 'y':
                     weight_matrix = sparse_reshape(weight_matrix, (bc, sc, fc+1))
                     weight_matrix = weight_matrix.sum(dim=0) / bc
                 else:
-                    bp, sp, fp = nodes[parent].shape
+                    bp, sp, fp = nodes[parent].act.shape
                     assert bp == bc
                     weight_matrix = sparse_reshape(weight_matrix, (bp, sp, fp+1, bc, sc, fc+1))
                     weight_matrix = weight_matrix.sum(dim=(0, 3)) / bc
@@ -416,7 +416,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', '-d', type=str, default='simple_train',
                         help="A subject-verb agreement dataset in data/, or a path to a cluster .json.")
-    parser.add_argument('--num_examples', '-n', type=int, default=1024,
+    parser.add_argument('--num_examples', '-n', type=int, default=32,
                         help="The number of examples from the --dataset over which to average indirect effects.")
     parser.add_argument('--example_length', '-l', type=int, default=None,
                         help="The max length (if using sum aggregation) or exact length (if not aggregating) of examples.")
@@ -430,9 +430,9 @@ if __name__ == '__main__':
                         help="ID of the dictionaries. Use `id` to obtain circuits on neurons/heads directly.")
     parser.add_argument('--dict_size', type=int, default=16384,
                         help="The width of the dictionary encoder.")
-    parser.add_argument('--batch_size', type=int, default=1,
+    parser.add_argument('--batch_size', type=int, default=2,
                         help="Number of examples to process at once when running circuit discovery.")
-    parser.add_argument('--aggregation', type=str, default='none',
+    parser.add_argument('--aggregation', type=str, default='sum',
                         help="Aggregation across token positions. Should be one of `sum` or `none`.")
     parser.add_argument('--node_threshold', type=float, default=0.1,
                         help="Indirect effect threshold for keeping circuit nodes.")
@@ -459,6 +459,9 @@ if __name__ == '__main__':
     dict_path = os.path.join(BASE_DIR, args.dict_path)
     circuit_dir = os.path.join(BASE_DIR, args.circuit_dir)
     plot_dir = os.path.join(BASE_DIR, args.plot_dir)
+
+    os.makedirs(circuit_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
 
     device = args.device
 

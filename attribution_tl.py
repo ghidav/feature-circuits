@@ -5,6 +5,7 @@ from numpy import ndindex
 from typing import Dict, Union
 from activation_utils import SparseAct
 from functools import partial
+import gc
 
 DEBUGGING = False
 
@@ -28,13 +29,9 @@ def _pe_attrib(
     hidden_states_clean = {}
     grads = {}
 
-    #_, clean_cache = model.get_cache_fw(clean, submodules)
     sae_hooks = []
 
-    def sae_hook(act, hook, recon):
-        return recon
-
-    def sae_hook(act, hook, sae):
+    def sae_hook(act, hook, sae, cache):
         original_shape = act.shape
         
         if len(original_shape) == 4:
@@ -43,56 +40,26 @@ def _pe_attrib(
             x = act.clone()
 
         x.requires_grad_(True)
+        
         x_hat, f = sae(x, output_features=True)
-        f.retain_grad()
+    
         residual = x - x_hat
-        hidden_states_clean[hook.name] = f
 
-        if residual.grad is None:
-            residual.grad = t.zeros_like(residual)
+        if t.is_grad_enabled():
+            f.retain_grad()
 
-        x_recon = x_hat + residual
+        cache[hook.name] = SparseAct(act=f, res=residual)
+
+        x_recon = x_hat + residual.detach()
         
         if len(original_shape) == 4:
             return x_recon.reshape(original_shape)
 
         return x_recon
 
-    ### FIX
-    """
     for i, submodule in enumerate(submodules):
         dictionary = dictionaries[submodule]
-
-        if i % 3 == 2:  # attention
-            original_shape = clean_cache[submodule].shape
-            x = clean_cache[submodule].reshape(clean_cache[submodule].shape[0], clean_cache[submodule].shape[1], -1).detach()
-        else:
-            x = clean_cache[submodule].detach()
-
-        # Ensure x requires gradients
-        x.requires_grad_(True)
-
-        x_hat, f = dictionary(x, output_features=True)  # x_hat implicitly depends on f
-        residual = x - x_hat
-        hidden_states_clean[submodule] = f
-
-        # Retain gradients for non-leaf tensors
-        hidden_states_clean[submodule].retain_grad()
-
-        # Initialize gradient for residual if not already initialized
-        if residual.grad is None:
-            residual.grad = t.zeros_like(residual)
-
-        x_recon = x_hat + residual
-
-        if i % 3 == 2:  # attention
-            sae_hooks.append((submodule, partial(sae_hook, recon=x_recon.reshape(original_shape))))
-        else:
-            sae_hooks.append((submodule, partial(sae_hook, recon=x_recon)))
-    """
-    for i, submodule in enumerate(submodules):
-        dictionary = dictionaries[submodule]
-        sae_hooks.append((submodule, partial(sae_hook, sae=dictionary)))
+        sae_hooks.append((submodule, partial(sae_hook, sae=dictionary, cache=hidden_states_clean)))
 
     # Forward pass with hooks
     logits = model.run_with_hooks(clean, fwd_hooks=sae_hooks)
@@ -105,7 +72,10 @@ def _pe_attrib(
     for submodule in submodules:
         if submodule in hidden_states_clean:
             grads[submodule] = hidden_states_clean[submodule].grad
-    
+            grads[submodule].res = t.zeros_like(hidden_states_clean[submodule].res)
+
+    #hidden_states_clean = {k : v.value for k, v in hidden_states_clean.items()}
+    #grads = {k : v.value for k, v in grads.items()}
 
     if patch is None:
         hidden_states_patch = {
@@ -113,23 +83,31 @@ def _pe_attrib(
         }
         total_effect = None
     else:
-        corr_logits, hidden_states_patch = model.get_cache_fw(clean, submodules)
+        hidden_states_patch = {}
+        sae_hooks = []
+        for i, submodule in enumerate(submodules):
+            dictionary = dictionaries[submodule]
+            sae_hooks.append((submodule, partial(sae_hook, sae=dictionary, cache=hidden_states_patch)))
+        
+        with t.no_grad():
+            corr_logits = model.run_with_hooks(patch, fwd_hooks=sae_hooks)
         metric_patch = metric_fn(corr_logits, **metric_kwargs)
         total_effect = (metric_patch - metric_clean).detach()
+        #hidden_states_patch = {k : v.value for k, v in hidden_states_patch.items()}
 
     effects = {}
     deltas = {}
     for submodule in submodules:
         patch_state, clean_state, grad = hidden_states_patch[submodule], hidden_states_clean[submodule], grads[submodule]
-        if len(patch_state.shape) == 4:
-            patch_state = patch_state.reshape(patch_state.shape[0], patch_state.shape[1], -1)
-
         delta = patch_state - clean_state.detach() if patch_state is not None else -clean_state.detach()
-        effect = delta * grad
+        effect = delta @ grad
         effects[submodule] = effect
         deltas[submodule] = delta
         grads[submodule] = grad
     total_effect = total_effect if total_effect is not None else None
+
+    del hidden_states_clean, hidden_states_patch
+    gc.collect()
     
     return EffectOut(effects, deltas, grads, total_effect)
 
@@ -162,7 +140,7 @@ def _pe_ig(
             residual = x - x_hat
             hidden_states_clean[submodule] = SparseAct(act=f.save(), res=residual.save())
         metric_clean = metric_fn(model, **metric_kwargs).save()
-    hidden_states_clean = {k : v.value for k, v in hidden_states_clean.items()}
+    hidden_states_clean = {k : v for k, v in hidden_states_clean.items()}
 
     if patch is None:
         hidden_states_patch = {
@@ -279,7 +257,7 @@ def _pe_exact(
         dictionary = dictionaries[submodule]
         clean_state = hidden_states_clean[submodule]
         patch_state = hidden_states_patch[submodule]
-        effect = SparseAct(act=t.zeros_like(clean_state.act), resc=t.zeros(*clean_state.res.shape[:-1])).to(model.device)
+        effect = SparseAct(act=t.zeros_like(clean_state.act), resc=t.zeros(*clean_state.res.shape[:-1])).to(device)
         
         # iterate over positions and features for which clean and patch differ
         idxs = t.nonzero(patch_state.act - clean_state.act)
@@ -342,8 +320,8 @@ def jvp(
         downstream_submod,
         downstream_features,
         upstream_submod,
-        left_vec : Union[SparseAct, Dict[int, SparseAct]],
-        right_vec : SparseAct,
+        left_vec,
+        right_vec,
         return_without_right = False,
         device='cuda'
 ):
@@ -357,80 +335,101 @@ def jvp(
         else:
             return t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(device), t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(device)
 
-    # first run through a test input to figure out which hidden states are tuples
-    is_tuple = {}
-    with model.trace("_"):
-        is_tuple[upstream_submod] = type(upstream_submod.output.shape) == tuple
-        is_tuple[downstream_submod] = type(downstream_submod.output.shape) == tuple
-
     downstream_dict, upstream_dict = dictionaries[downstream_submod], dictionaries[upstream_submod]
 
     vjv_indices = {}
     vjv_values = {}
+    
     if return_without_right:
         jv_indices = {}
         jv_values = {}
 
-    with model.trace(input, **tracer_kwargs):
-        # first specify forward pass modifications
-        x = upstream_submod.output
-        if is_tuple[upstream_submod]:
-            x = x[0]
-        x_hat, f = upstream_dict(x, output_features=True)
-        x_res = x - x_hat
-        upstream_act = SparseAct(act=f, res=x_res).save()
-        if is_tuple[upstream_submod]:
-            upstream_submod.output[0][:] = x_hat + x_res
-        else:
-            upstream_submod.output = x_hat + x_res
-        y = downstream_submod.output
-        if is_tuple[downstream_submod]:
-            y = y[0]
-        y_hat, g = downstream_dict(y, output_features=True)
-        y_res = y - y_hat
-        downstream_act = SparseAct(act=g, res=y_res).save()
+    cache = {}
 
-        for downstream_feat in downstream_features:
+    def sae_hook(act, hook, sae, cache):
+        original_shape = act.shape
+        
+        if len(original_shape) == 4:
+            x = act.reshape(act.shape[0], act.shape[1], -1).clone()
+        else:
+            x = act.clone()
+        
+        x_hat, f = sae(x, output_features=True)
+        
+        if t.is_grad_enabled():
+            f.retain_grad()
+        
+        residual = x - x_hat
+        cache[hook.name] = SparseAct(act=f, res=residual)
+
+        #residual.grad = t.zeros_like(residual)
+
+        x_recon = x_hat + residual.detach()
+        
+        if len(original_shape) == 4:
+            return x_recon.reshape(original_shape)
+
+        return x_recon
+
+    sae_hook = [
+        (upstream_submod, partial(sae_hook, sae=upstream_dict, cache=cache)),
+        (downstream_submod, partial(sae_hook, sae=downstream_dict, cache=cache))
+    ]
+
+    _ = model.run_with_hooks(input, fwd_hooks=sae_hook)
+
+    downstream_act = cache[downstream_submod]
+    upstream_act = cache[upstream_submod]
+    
+    for downstream_feat in downstream_features:
             if isinstance(left_vec, SparseAct):
                 to_backprop = (left_vec @ downstream_act).to_tensor().flatten()
             elif isinstance(left_vec, dict):
                 to_backprop = (left_vec[downstream_feat] @ downstream_act).to_tensor().flatten()
             else:
                 raise ValueError(f"Unknown type {type(left_vec)}")
-            vjv = (upstream_act.grad @ right_vec).to_tensor().flatten()
-            if return_without_right:
-                jv = (upstream_act.grad @ right_vec).to_tensor().flatten()
-            x_res.grad = t.zeros_like(x_res)
+
             to_backprop[downstream_feat].backward(retain_graph=True)
 
-            vjv_indices[downstream_feat] = vjv.nonzero().squeeze(-1).save()
-            vjv_values[downstream_feat] = vjv[vjv_indices[downstream_feat]].save()
+            upstream_act_grad = upstream_act.grad
+            downstream_act_grad = downstream_act.grad
+
+            upstream_act_grad.res = t.zeros_like(upstream_act.res)
+            downstream_act_grad.res = t.zeros_like(downstream_act.res)
+
+            vjv = (upstream_act_grad @ right_vec).to_tensor().flatten()
+            if return_without_right:
+                jv = (upstream_act_grad @ right_vec).to_tensor().flatten()
+            #x_res.grad = t.zeros_like(x_res)
+            
+            vjv_indices[downstream_feat] = vjv.nonzero().squeeze(-1)
+            vjv_values[downstream_feat] = vjv[vjv_indices[downstream_feat]]
 
             if return_without_right:
-                jv_indices[downstream_feat] = jv.nonzero().squeeze(-1).save()
-                jv_values[downstream_feat] = jv[vjv_indices[downstream_feat]].save()
+                jv_indices[downstream_feat] = jv.nonzero().squeeze(-1)
+                jv_values[downstream_feat] = jv[vjv_indices[downstream_feat]]
 
     # get shapes
-    d_downstream_contracted = len((downstream_act.value @ downstream_act.value).to_tensor().flatten())
-    d_upstream_contracted = len((upstream_act.value @ upstream_act.value).to_tensor().flatten())
+    d_downstream_contracted = len((downstream_act @ downstream_act).to_tensor().flatten())
+    d_upstream_contracted = len((upstream_act @ upstream_act).to_tensor().flatten())
     if return_without_right:
-        d_upstream = len(upstream_act.value.to_tensor().flatten())
+        d_upstream = len(upstream_act.to_tensor().flatten())
 
 
     vjv_indices = t.tensor(
-        [[downstream_feat for downstream_feat in downstream_features for _ in vjv_indices[downstream_feat].value],
-         t.cat([vjv_indices[downstream_feat].value for downstream_feat in downstream_features], dim=0)]
+        [[downstream_feat for downstream_feat in downstream_features for _ in vjv_indices[downstream_feat]],
+         t.cat([vjv_indices[downstream_feat] for downstream_feat in downstream_features], dim=0)]
     ).to(device)
-    vjv_values = t.cat([vjv_values[downstream_feat].value for downstream_feat in downstream_features], dim=0)
+    vjv_values = t.cat([vjv_values[downstream_feat] for downstream_feat in downstream_features], dim=0)
 
     if not return_without_right:
         return t.sparse_coo_tensor(vjv_indices, vjv_values, (d_downstream_contracted, d_upstream_contracted))
 
     jv_indices = t.tensor(
-        [[downstream_feat for downstream_feat in downstream_features for _ in jv_indices[downstream_feat].value],
-         t.cat([jv_indices[downstream_feat].value for downstream_feat in downstream_features], dim=0)]
+        [[downstream_feat for downstream_feat in downstream_features for _ in jv_indices[downstream_feat]],
+         t.cat([jv_indices[downstream_feat] for downstream_feat in downstream_features], dim=0)]
     ).to(device)
-    jv_values = t.cat([jv_values[downstream_feat].value for downstream_feat in downstream_features], dim=0)
+    jv_values = t.cat([jv_values[downstream_feat] for downstream_feat in downstream_features], dim=0)
 
     return (
         t.sparse_coo_tensor(vjv_indices, vjv_values, (d_downstream_contracted, d_upstream_contracted)),
